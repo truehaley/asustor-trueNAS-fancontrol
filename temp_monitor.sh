@@ -19,7 +19,7 @@
 # depends on:
 #
 # custom asustor-it87 kmod to read/set fan speeds:
-#    Needs to be compiled from source - see https://github.com/mafredri/asustor-platform-driver/blob/it87/README.md 
+#    Needs to be compiled from source - see https://github.com/mafredri/asustor-platform-driver/blob/it87/README.md
 #    as the debian/TrueNAS-supplied it87 doesn't support the IT8625E used in the asustor
 #    IMPORTANT: must use the it87 branch
 
@@ -27,15 +27,17 @@
 # uses sqr(temp above threshold/2)+base_pwm for cpu/sys response curve
 # uses sqr(temp above threshold/1.8)+base_pwm for NVME response curve
 #
-# this gives a slow initial ramp up and a rapid final ramp up across the desired temp range 
+# this gives a slow initial ramp up and a rapid final ramp up across the desired temp range
 #  sys range 50-75 celsius
 #  NVME temp range 35-70 (1.8 will set the fan to max rpm at a temp of 60)
 
+# Add log output to syslog
+exec 1> >(logger -s -t $(basename $0)) 2>&1
 
 # global variables to tune behaviour
 
 # debug output level : 0 = disabled 1 = minimal 2 = verbose 3 = extremely verbose
-debug=0
+debug=2
 
 # enable email fan change alets
 mailalerts=1
@@ -51,20 +53,22 @@ fi
 # how often we check temps / set speed ( in seconds )
 frequency=10
 
-# ratio of how often we update system sensors vs hdd sensors
-# sampling the sys sensors is lightweight, wheras querying the hdd sensors via SMART disrupts disk i/o - and hdd temp doesn't change that fast
-ratio_sys_to_hdd=1 # BMc set to 1 instead of original 12 as I don't think the above applies to nvme drives.
+# ratio of how often we update system and nvme sensors vs hdd sensors
+# sampling the sys and nvme sensors is lightweight, wheras querying the hdd sensors via SMART disrupts disk i/o - and hdd temp doesn't change that fast
+ratio_sys_to_hdd=12
 
 # the hdd temperature above which we start to increase fan speed
+nvme_threshold=35
 hdd_threshold=35
 
 # the system temperatures above which we start to increase fan speed
 sys_threshold=50
 
 # minimum pwm value we ever want to set the fan to ( 70 == 1600 rpm, 60 == 1400 )
-min_pwm=60
+min_pwm=70
 
 # How much of a temp change do we look for before altering fan speeds so we limit fan hunting
+nvme_delta_threshold=2
 hdd_delta_threshold=2
 sys_delta_threshold=4
 
@@ -94,17 +98,17 @@ fi
 # Use an array to find which /sys/class/hwmon symlinks point to the NVMe drive sensors and assign them sequential variables
 #    This should find all NVMe drives regardless of the number installed, and assign them to
 #    sequential variables hwmon_nvme1, hwmon_nvme2 ... hwmon_nvme(x)
-hwmon_nvme=()
+all_hwmon_nvmes=()
 i=1
 while read -r path; do
-  hwmon_nvme[$i]="/sys/class/hwmon/$path"
+  all_hwmon_nvmes[$i]="/sys/class/hwmon/$path"
   ((i++))
 done < <(ls -lQ /sys/class/hwmon | grep -i nvme | cut -d "\"" -f 2)
 
-# Assign all the paths stored in the hwmon_nvme array to sequential hwmon_nvme variables
-for ((j=1; j<=i; j++)); do
+# Assign all the paths stored in the all_hwmon_nvmes array to sequential hwmon_nvme variables
+for ((j=1; j<i; j++)); do
   variable_name="hwmon_nvme$j"
-  eval "$variable_name=\"${hwmon_nvme[$j]}\""
+  eval "$variable_name=\"${all_hwmon_nvmes[$j]}\""
 done
 
 # Display the NVMe hardware monitoring devices found if debug is on
@@ -131,43 +135,87 @@ function set_fan_speed() {
 function get_fan_speed() {
 
     fan_rpm=`cat $hwmon_it87/fan1_input`
+    if [ $debug -gt 1 ]; then
+        echo "GET_FAN_SPEED: fan_rpm=$fan_rpm"
+    fi
 
 }
 
 
 # query all NVMe drive temperatures and set the global hdd_temp to the highest #
-function get_hdd_temp() {
+function get_nvme_temp() {
 
-# Initialize the maximum hdd (NVMe) temperature variable (Absolute zero, Baby!)
-hdd_temp=-273
+    # Initialize the maximum hdd (NVMe) temperature variable (Absolute zero, Baby!)
+    nvme_temp=-273
 
-# Each NVMe drive has multiple temp sensors, and there is no industry standard for
-#   the number of sensors or what each sensor monitors. So safest to check all
-#   temps and find the highest
-# Loop through all tempX_input entries in each of the hwmon_nvmeX variables
-for varname in ${!hwmon_nvme*}; do
-  for temp_file in ${!varname}/temp[0-9]*_input; do
-    if [ -e "$temp_file" ]; then
-      temp=$(cat $temp_file)
-      if (( $temp > $hdd_temp )); then
-        hdd_temp=$temp
-      fi
-      # Print the value of each temp sensor if debug is on
-      if (( $debug > 1 )); then
-        echo "Temperature value: $temp, NVMe variable: $varname, Temperature file: $temp_file"
-      fi
-    fi
-  done
-done
+    # Each NVMe drive has multiple temp sensors, and there is no industry standard for
+    #   the number of sensors or what each sensor monitors. So safest to check all
+    #   temps and find the highest
+    # Loop through all tempX_input entries in each of the hwmon_nvmeX variables
+    details=""
+    for varname in ${!hwmon_nvme*}; do
+        alltemps=""
+        for temp_file in ${!varname}/temp[0-9]*_input; do
+            if [ -e "$temp_file" ]; then
+                temp=$(cat $temp_file)
+                if (( $temp > $nvme_temp )); then
+                    nvme_temp=$temp
+                fi
+                alltemps="$alltemps $temp"
+                # Print the value of each temp sensor if debug is on
+                if (( $debug > 2 )); then
+                    echo "Temperature value: $temp, NVMe variable: $varname, Temperature file: $temp_file"
+                fi
+            fi
+        done
+        details="$details $varname=[$alltemps ]"
+    done
 
-hdd_temp=$(expr $hdd_temp / 1000)
+    nvme_temp=$(expr $nvme_temp / 1000)
 
     if [ $debug -gt 1 ]; then
-       echo "GET_HDD_TEMP: hdd_temp= " $hdd_temp
+        echo "GET_NVME_TEMP: nvme_temp=$nvme_temp ($details )"
     fi
 
 }
 
+# query all drive temperatures and set the global hdd_temp to the highest
+function get_hdd_temp() {
+
+    hdd_temp=-273
+
+    # presume we have up to 8 drives - find the highest temperature on them
+    #
+    # if you have an external HDD / m.2 sata ssd as the boot device you'll need to exclude it from the drive list so as to ignore it's temperature
+
+    details=""
+    for i in sda sdb sdc sdd sde sdf sdg sdh
+    do
+        # SMART attribute 194 is drive temperature
+        temp=`smartctl -A /dev/$i | awk '$1 == "194" { print $10 }'`
+        if [ -z $temp ]; then
+           if [ $debug -gt 2 ]; then
+              echo "temp is NULL - drive does not exist"
+           fi
+        else
+            details="$details $i=$temp"
+            if [ $debug -gt 2 ]; then
+                echo "drive=" $i " temp=" $temp
+            fi
+            if [ $temp -gt $hdd_temp ]; then
+                hdd_temp=$temp
+                if [ $debug -gt 2 ]; then
+                    echo "setting hdd_temp"
+                fi
+            fi
+        fi
+    done
+
+    if [ $debug -gt 1 ]; then
+       echo "GET_HDD_TEMP:  hdd_temp =$hdd_temp ($details )"
+    fi
+
+}
 
 # query system temperatures and set the global sys_temp with the highest
 function get_sys_temp() {
@@ -184,51 +232,91 @@ function get_sys_temp() {
     sys_temp=$(( $acpi_temp > $cpu_temp ? $acpi_temp : $cpu_temp ))
 
     if [[ $debug -gt 1 ]] ; then
-       echo "GET_SYS_TEMP: acpi temp=" $acpi_temp " cpu_temp=" $cpu_temp " sys_temp=" $sys_temp
+       echo "GET_SYS_TEMP:  sys_temp =$sys_temp ( acpi_temp=$acpi_temp cpu_temp=$cpu_temp )"
     fi
 
 }
 
 
-# map the current hdd_temp to a desired pwm value
+# map the current nvme_temp to a desired pwm value
 #
-# we use base_pwm_value+sqr(hdd_temp-hdd_threshold)/1.8 to get a nice curve. 
+# we use base_pwm_value+sqr(hdd_temp-hdd_threshold)/1.8 to get a nice curve.
 # I used 1.8 as the fudge factor to get max fan rpm at NVME temp of 60 degrees
 #
+function map_nvme_temp() {
+    if [[ $nvme_temp -le $nvme_threshold ]] ; then
+
+        details="nvme_temp=$nvme_temp under threshold=$nvme_threshold"
+        if [[ $debug -gt 2 ]]; then
+            echo "MAP_NVME_TEMP: nvme temp=" $nvme_temp " and is under threshold"
+        fi
+
+        nvme_desired_pwm=$min_pwm
+
+    else
+
+        details="nvme_temp=$nvme_temp  OVER threshold=$nvme_threshold"
+        if [[ $debug -gt 2 ]] ; then
+            echo "MAP_NVME_TEMP: nvme temp=" $nvme_temp " and is over threshold"
+        fi
+
+        # get the difference above threshold
+        let nvme_desired_pwm=$nvme_temp-$nvme_threshold
+        # fudge factor the difference
+        let nvme_desired_pwm=$nvme_desired_pwm*10/18
+        # square it
+        let nvme_desired_pwm=$nvme_desired_pwm*$nvme_desired_pwm
+        # add it to the base_pwm value
+        let nvme_desired_pwm=$min_pwm+$nvme_desired_pwm
+
+    fi
+
+    if [[ $nvme_desired_pwm -gt 255 ]] ; then
+        # over max - truncate to max
+        nvme_desired_pwm=255
+    fi
+
+    if [[ $debug -gt 1 ]] ; then
+        echo "MAP_NVME_TEMP: nvme_desired_pwm=$nvme_desired_pwm ($details)"
+    fi
+}
+
 function map_hdd_temp() {
-     if [[ $hdd_temp -le $hdd_threshold ]] ; then
+    if [[ $hdd_temp -le $hdd_threshold ]] ; then
 
-          if [[ $debug -gt 1 ]]; then
-             echo "MAP_HDD_TEMP: hdd temp=" $hdd_temp " and is under threshold"
-          fi
+        details="hdd_temp=$hdd_temp under threshold=$hdd_threshold"
+        if [[ $debug -gt 2 ]]; then
+            echo "MAP_HDD_TEMP: hdd_temp=" $hdd_temp " and is under threshold"
+        fi
 
-          hdd_desired_pwm=$min_pwm
+        hdd_desired_pwm=$min_pwm
 
-     else
+    else
 
-          if [[ $debug -gt 1 ]] ; then
-             echo "MAP_HDD_TEMP: hdd temp=" $hdd_temp " and is over threshold"
-          fi
+        details="hdd_temp=$hdd_temp  OVER threshold=$hdd_threshold"
+        if [[ $debug -gt 2 ]] ; then
+            echo "MAP_HDD_TEMP: hdd_temp=" $hdd_temp " and is over threshold"
+        fi
 
-          # get the difference above threshold
-          let hdd_desired_pwm=$hdd_temp-$hdd_threshold
-          # fudge factor the difference
-          let hdd_desired_pwm=$hdd_desired_pwm*10/18
-          # square it
-          let hdd_desired_pwm=$hdd_desired_pwm*$hdd_desired_pwm
-          # add it to the base_pwm value
-          let hdd_desired_pwm=$min_pwm+$hdd_desired_pwm
+        # get the difference above threshold
+        let hdd_desired_pwm=$hdd_temp-$hdd_threshold
+        # fudge factor the difference
+        let hdd_desired_pwm=$hdd_desired_pwm*10/18
+        # square it
+        let hdd_desired_pwm=$hdd_desired_pwm*$hdd_desired_pwm
+        # add it to the base_pwm value
+        let hdd_desired_pwm=$min_pwm+$hdd_desired_pwm
 
-     fi
+    fi
 
-     if [[ $hdd_desired_pwm -gt 255 ]] ; then
-          # over max - truncate to max
-          hdd_desired_pwm=255
-     fi
+    if [[ $hdd_desired_pwm -gt 255 ]] ; then
+        # over max - truncate to max
+        hdd_desired_pwm=255
+    fi
 
-     if [[ $debug -gt 1 ]] ; then
-        echo "MAP_HDD_TEMP: hdd_desired_pwm=" $hdd_desired_pwm
-     fi
+    if [[ $debug -gt 1 ]] ; then
+        echo "MAP_HDD_TEMP:  hdd_desired_pwm =$hdd_desired_pwm ( $details)"
+    fi
 }
 
 
@@ -237,39 +325,41 @@ function map_hdd_temp() {
 # we use base_pwm_value+sqr((sys_temp-sys_threshold)/2) to get a nice curve
 #
 function map_sys_temp() {
-     if [[ $sys_temp -le $sys_threshold ]] ; then
+    if [[ $sys_temp -le $sys_threshold ]] ; then
 
-          if [[ $debug -gt 1 ]] ; then
-             echo "MAP_SYS_TEMP: sys_temp=" $sys_temp " and is under threshold"
-          fi
+        details="sys_temp=$sys_temp under threshold=$sys_threshold"
+        if [[ $debug -gt 2 ]] ; then
+            echo "MAP_SYS_TEMP: sys_temp=" $sys_temp " and is under threshold"
+        fi
 
-          sys_desired_pwm=$min_pwm
+        sys_desired_pwm=$min_pwm
 
-     else
+    else
 
-          if [[ $debug -gt 1 ]] ; then
-             echo "MAP_SYS_TEMP: sys_temp=" $sys_temp " and is over threshold"
-          fi
+        details="sys_temp=$sys_temp  OVER threshold=$sys_threshold"
+        if [[ $debug -gt 2 ]] ; then
+            echo "MAP_SYS_TEMP: sys_temp=" $sys_temp " and is over threshold"
+        fi
 
-          # get the difference above threshold
-          let sys_desired_pwm=$sys_temp-$sys_threshold
-          # halve the difference
-          let sys_desired_pwm=$sys_desired_pwm/2
-          # then square it
-          let sys_desired_pwm=$sys_desired_pwm*$sys_desired_pwm
-          # add it to the base pwm value
-          let sys_desired_pwm=$min_pwm+$sys_desired_pwm
+        # get the difference above threshold
+        let sys_desired_pwm=$sys_temp-$sys_threshold
+        # halve the difference
+        let sys_desired_pwm=$sys_desired_pwm/3
+        # then square it
+        let sys_desired_pwm=$sys_desired_pwm*$sys_desired_pwm
+        # add it to the base pwm value
+        let sys_desired_pwm=$min_pwm+$sys_desired_pwm
 
-     fi
+    fi
 
-     if [[ $sys_desired_pwm -gt 255 ]] ; then
-          # over max - truncate to max
-          sdd_desired_pwm=255
-     fi
+    if [[ $sys_desired_pwm -gt 255 ]] ; then
+        # over max - truncate to max
+        sdd_desired_pwm=255
+    fi
 
-     if [[ $debug -gt 1 ]] ; then
-        echo "MAP_SYS_TEMP: sys_desired_pwm=" $sys_desired_pwm
-     fi
+    if [[ $debug -gt 1 ]] ; then
+        echo "MAP_SYS_TEMP:  sys_desired_pwm =$sys_desired_pwm ( $details)"
+    fi
 }
 
 
@@ -277,17 +367,23 @@ function map_sys_temp() {
 function get_desired_pwm() {
 
     map_sys_temp
+    map_nvme_temp
     map_hdd_temp
 
-    if [[ $hdd_desired_pwm -gt $sys_desired_pwm ]] ; then
+    if [[ $nvme_desired_pwm -gt $sys_desired_pwm ]] && [[ $nvme_desired_pwm -gt $hdd_desired_pwm ]] ; then
+         desired_pwm=$nvme_desired_pwm
+         if [[ $debug -gt 1 ]] ; then
+            echo "GET_DESIRED_PWM: choosing nvme_pwm - desired_pwm=$desired_pwm (nvme_desired_pwm=$nvme_desired_pwm hdd_desired_pwm=$hdd_desired_pwm sys_desired_pwm=$sys_desired_pwm)"
+         fi
+    elif [[ $hdd_desired_pwm -gt $sys_desired_pwm ]] && [[ $hdd_desired_pwm -gt $nvme_desired_pwm ]] ; then
          desired_pwm=$hdd_desired_pwm
-         if [[ $debug -gt 2 ]] ; then
-            echo "GET_DESIRED_PWM: choosing hdd_pwm value - desired_pwm=" $desired_pwm " hdd_desired_pwm=" $hdd_desired_pwm " sys_desired_pwm=" $sys_desired_pwm
+         if [[ $debug -gt 1 ]] ; then
+            echo "GET_DESIRED_PWM: choosing hdd_pwm - desired_pwm=$desired_pwm (nvme_desired_pwm=$nvme_desired_pwm hdd_desired_pwm=$hdd_desired_pwm sys_desired_pwm=$sys_desired_pwm)"
          fi
     else
          desired_pwm=$sys_desired_pwm
-         if [[ $debug -gt 2 ]] ; then
-            echo "GET_DESIRED_PWM:  choosing sys_pwm value - desired_pwm=" $desired_pwm " hdd_desired_pwm=" $hdd_desired_pwm " sys_desired_pwm=" $sys_desired_pwm
+         if [[ $debug -gt 1 ]] ; then
+            echo "GET_DESIRED_PWM:  choosing sys_pwm - desired_pwm=$desired_pwm (nvme_desired_pwm=$nvme_desired_pwm hdd_desired_pwm=$hdd_desired_pwm sys_desired_pwm=$sys_desired_pwm)"
          fi
     fi
 }
@@ -296,11 +392,16 @@ function get_desired_pwm() {
 
 # get initial temperatures
 
-get_sys_temp
-get_hdd_temp
+if [[ $debug -gt 1 ]] ; then
+    echo "******************************************"
+fi
 get_fan_speed
+get_sys_temp
+get_nvme_temp
+get_hdd_temp
 
 last_sys_temp=$sys_temp
+last_nvme_temp=$nvme_temp
 last_hdd_temp=$hdd_temp
 
 # we use the variables 'last_pwm' 'last_sys_temp' and 'last_hdd_temp' to track what the pwm/temps values were last time
@@ -315,7 +416,7 @@ last_pwm=$desired_pwm
 # set initial fan speed
 
 if [[ $debug -gt 1 ]] ; then
-   echo "MAIN: initial fan pwm=" $desired_pwm
+   echo "MAIN: initial fan pwm=$desired_pwm"
 fi
 
 set_fan_speed
@@ -327,14 +428,17 @@ cycles=$ratio_sys_to_hdd
 while true; do
 
     # update sensor readings
+    if [[ $debug -gt 1 ]] ; then
+        echo "******************************************"
+    fi
 
     get_fan_speed
-
     get_sys_temp
+    get_nvme_temp
 
     if [[ $cycles -eq 1 ]] ; then
 
-       if [[ $debug -gt 1 ]] ; then
+       if [[ $debug -gt 2 ]] ; then
           echo "MAIN: sampling hdd sensor"
        fi
 
@@ -344,7 +448,7 @@ while true; do
     else
 
        if [[ $debug -gt 1 ]] ; then
-          echo "MAIN: skipping hdd sensor update"
+          echo "GET_HDD_TEMP:  hdd_temp =$hdd_temp ( skipped update )"
        fi
 
        let cycles=$cycles-1
@@ -356,21 +460,23 @@ while true; do
     get_desired_pwm
 
     if [[ $debug -gt 1 ]] ; then
-         echo "MAIN: desired_pwm=" $desired_pwm " last_pwm=" $last_pwm
-         echo "MAIN: sys_temp=" $sys_temp " last_sys_temp=" $last_sys_temp
-         echo "MAIN: hdd_temp=" $hdd_temp " last_hdd_temp=" $last_hdd_temp
-         echo "MAIN: fan_rpm=" $fan_rpm
+        echo "MAIN: current/last desired_pwm=$desired_pwm/$last_pwm sys_temp=$sys_temp/$last_sys_temp nvme_temp=$nvme_temp/$last_nvme_temp hdd_temp=$hdd_temp/$last_hdd_temp fan_rpm=$fan_rpm"
+        #echo "MAIN: desired_pwm=" $desired_pwm " last_pwm=" $last_pwm
+        #echo "MAIN: sys_temp=" $sys_temp " last_sys_temp=" $last_sys_temp
+        #echo "MAIN: nvme_temp=" $nvme_temp " last_nvme_temp=" $last_nvme_temp
+        #echo "MAIN: hdd_temp=" $hdd_temp " last_hdd_temp=" $last_hdd_temp
+        #echo "MAIN: fan_rpm=" $fan_rpm
     fi
 
     if [[ $desired_pwm -gt $last_pwm ]] ; then
        # fan speed increase desired - react immediately
 
        if [[ $debug -ge 1 ]] ; then
-          echo "!!!! fan speed INCREASE : hdd_temp " $hdd_temp " sys_temp " $sys_temp " fan_rpm " $fan_rpm " - changing fan speed to " $desired_pwm
+          echo "****: fan INCREASE pwm=$desired_pwm (nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm)"
        fi
 
        if [[ $mailalerts -ge 1 ]] ; then
-          echo "!!!! fan speed INCREASE : hdd_temp " $hdd_temp " sys_temp " $sys_temp " fan_rpm " $fan_rpm " - changing fan speed to" $desired_pwm | mail $mail_address -s "$mail_name - temperature alert"
+          echo "****: fan INCREASE pwm=$desired_pwm (nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm)" | mail $mail_address -s "$mail_name - temperature alert"
        fi
 
        # set the fan speed
@@ -381,57 +487,60 @@ while true; do
 
        last_pwm=$desired_pwm
        last_sys_temp=$sys_temp
+       last_nvme_temp=$nvme_temp
        last_hdd_temp=$hdd_temp
     fi
 
     if [[ $desired_pwm -lt $last_pwm ]] ; then
-       # fan speed decrease desired
+        # fan speed decrease desired
 
-       # calculate deltas from last reading for each sensor
+        # calculate deltas from last reading for each sensor
 
-       let hdd_delta=$last_hdd_temp-$hdd_temp
-       let sys_delta=$last_sys_temp-$sys_temp
+        let nvme_delta=$last_nvme_temp-$nvme_temp
+        let hdd_delta=$last_hdd_temp-$hdd_temp
+        let sys_delta=$last_sys_temp-$sys_temp
 
-       if [[ $debug -gt 1 ]] ; then
-          echo "MAIN: current sys_delta=" $sys_delta " current hdd_delta=" $hdd_delta
-       fi
+        if [[ $debug -gt 1 ]] ; then
+            echo "MAIN: current sys_delta=$sys_delta current nvme_delta=$nvme_delta current hdd_delta=$hdd_delta"
+        fi
 
-       # we need to apply some degree of hysteresis on hdd_temp and sys_temp to prevent fan speed hunting, 
-       # variables defined at the start of the script
+        # we need to apply some degree of hysteresis on hdd_temp and sys_temp to prevent fan speed hunting,
+        # variables defined at the start of the script
 
-       if [[ $hdd_delta -gt $hdd_delta_threshold ]] || [[ $sys_delta -gt $sys_delta_threshold ]]; then
+        if [[ $nvme_delta -gt $nvme_delta_threshold ]] || [[ $hdd_delta -gt $hdd_delta_threshold ]] || [[ $sys_delta -gt $sys_delta_threshold ]]; then
 
-          # we've got sufficient downward temp delta - actually change the fan speed
+            # we've got sufficient downward temp delta - actually change the fan speed
 
-          if [[ $debug -ge 1 ]] ; then
-             echo "!!!! fan speed DECREASE : hdd_temp " $hdd_temp " sys_temp " $sys_temp " fan_rpm " $fan_rpm " - changing fan speed to " $desired_pwm
-          fi
-          if [[ $mailalerts -ge 1 ]] ; then
-             echo "!!!! fan speed DECREASE : hdd_temp " $hdd_temp " sys_temp " $sys_temp " fan_rpm " $fan_rpm " - changing fan speed to" $desired_pwm | mail $mail_address -s "$mail_name - temperature alert"
-          fi
+            if [[ $debug -ge 1 ]] ; then
+                echo "****: fan DECREASE pwm=$desired_pwm (nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm)"
+            fi
+            if [[ $mailalerts -ge 1 ]] ; then
+                echo "****: fan DECREASE pwm=$desired_pwm (nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm)" | mail $mail_address -s "$mail_name - temperature alert"
+            fi
 
-          # set the fan speed
+            # set the fan speed
 
-          set_fan_speed
+            set_fan_speed
 
-          # update state tracking variables ONLY when there's a change in the target fan speed
+            # update state tracking variables ONLY when there's a change in the target fan speed
 
-          last_pwm=$desired_pwm
-          last_sys_temp=$sys_temp
-          last_hdd_temp=$hdd_temp
+            last_pwm=$desired_pwm
+            last_sys_temp=$sys_temp
+            last_nvme_temp=$nvme_temp
+            last_hdd_temp=$hdd_temp
 
-       else
+        else
 
-          # not enough downward delta to trigger an actual change yet
+            # not enough downward delta to trigger an actual change yet
 
-          if [[ $debug -ge 1 ]] ; then
-             echo "!!!! fan speed DECREASE : hdd_temp " $hdd_temp " sys_temp " $sys_temp " - but not enough delta (" $hdd_delta " " $sys_delta ") yet!"
-          fi
-       fi
+            if [[ $debug -ge 1 ]] ; then
+                echo "****: fan PENDING  pwm=$desired_pwm (nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm) - not enough delta ( $sys_delta $nvme_delta $hdd_delta ) yet!"
+            fi
+        fi
     fi
 
     if [[ $debug -ge 1 ]] ; then
-           echo "MAIN: sleeping for " $frequency " seconds"
+        echo "MAIN: sleeping for " $frequency " seconds"
     fi
     sleep $frequency
 
