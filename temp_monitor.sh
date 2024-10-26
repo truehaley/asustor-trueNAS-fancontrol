@@ -2,6 +2,10 @@
 
 # Asustor Flashstor6 and Flashstor12 Pro fan control script for TrueNAS-SCALE 22
 #
+# Run me as a post-init command:
+#   nohup /home/truenas_admin/bin/temp_monitor.sh > /dev/null &
+# Desired debug output level (set below as debugLvl) will be written to /var/log/syslog
+
 # Standing on the shoulders of giants: adapted from John Davis' original script at
 #     https://gist.github.com/johndavisnz/06a5e1aabaf878add0ad95669b3a0b3d
 #
@@ -75,8 +79,15 @@ hdd_threshold=38
 # the system temperatures above which we start to increase fan speed
 sys_threshold=50
 
-# minimum pwm value we ever want to set the fan to ( 70 ~= 1000 rpm on AS5404T )
-min_pwm=70
+# minimum pwm value we ever want to set the fan to
+# Stats     Noctua NF-P12   Stock SAB4B2U
+#   70          550             1000
+#   100         760
+#   110         830
+#   140         1000
+#   200         1415
+#   255         1730
+min_pwm=140
 
 # How much of a temp change do we look for before altering fan speeds so we limit fan hunting
 nvme_delta_threshold=2
@@ -339,13 +350,13 @@ function get_desired_pwm() {
 
     if [[ $nvme_desired_pwm -gt $sys_desired_pwm ]] && [[ $nvme_desired_pwm -gt $hdd_desired_pwm ]] ; then
         desired_pwm=$nvme_desired_pwm
-        debug 2 "CHOOSE_PWM: nvme $desired_pwm ( nvme_pwm=$nvme_desired_pwm hdd_pwm=$hdd_desired_pwm sys_pwm=$sys_desired_pwm )"
+        debug 2 "CHOOSE_PWM: nvme $desired_pwm ( sys_pwm=$sys_desired_pwm nvme_pwm=$nvme_desired_pwm hdd_pwm=$hdd_desired_pwm )"
     elif [[ $hdd_desired_pwm -gt $sys_desired_pwm ]] && [[ $hdd_desired_pwm -gt $nvme_desired_pwm ]] ; then
         desired_pwm=$hdd_desired_pwm
-        debug 2 "CHOOSE_PWM:  hdd $desired_pwm ( nvme_pwm=$nvme_desired_pwm hdd_pwm=$hdd_desired_pwm sys_pwm=$sys_desired_pwm )"
+        debug 2 "CHOOSE_PWM:  hdd $desired_pwm ( sys_pwm=$sys_desired_pwm nvme_pwm=$nvme_desired_pwm hdd_pwm=$hdd_desired_pwm )"
     else
         desired_pwm=$sys_desired_pwm
-        debug 2 "CHOOSE_PWM:  sys $desired_pwm ( nvme_pwm=$nvme_desired_pwm hdd_pwm=$hdd_desired_pwm sys_pwm=$sys_desired_pwm )"
+        debug 2 "CHOOSE_PWM:  sys $desired_pwm ( sys_pwm=$sys_desired_pwm nvme_pwm=$nvme_desired_pwm hdd_pwm=$hdd_desired_pwm )"
     fi
 }
 
