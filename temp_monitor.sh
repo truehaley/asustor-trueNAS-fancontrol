@@ -98,8 +98,6 @@ declare -r sys_delta_threshold=4
 
 
 #### determine the /sys/class/hwmon mappings ####
-
-
 debug 1 "STARTUP: Fan control:"
 # which /sys/class/hwmon symlink points to the asustor_it87 ( fan speed )
 declare -r hwmon_it87="/sys/class/hwmon/"`ls -lQ /sys/class/hwmon | grep -i it87 | cut -d "\"" -f 2`
@@ -144,6 +142,7 @@ function set_fan_pwm() {
     echo $new_pwm >$hwmon_it87/pwm1
 }
 
+
 # query fan speed and set the global fan_rpm
 function get_fan_rpm() {
     fan_rpm=$(<"$hwmon_it87/fan1_input")
@@ -151,9 +150,33 @@ function get_fan_rpm() {
     debug 2 "FAN  PWM: $fan_pwm  RPM:  $fan_rpm"
 }
 
+
+function scale_pwm () {
+    declare -n temp="$1_temp"
+    declare -n thresh="$1_threshold"
+    declare -n thresh_details="$1_thresh_details"
+    declare -n desired_pwm="$1_desired_pwm"
+    declare -i fudge=$2
+
+    if [[ $temp -le $thresh ]] ; then
+        thresh_details="$temp < $thresh"
+        desired_pwm=$min_pwm
+    else
+        thresh_details="$temp > $thresh"
+
+        # get the difference above threshold and fudge factor the difference
+        (( desired_pwm = (temp-thresh)*10/fudge  ))
+        # square and add to the base_pwm value
+        (( desired_pwm = desired_pwm*desired_pwm + min_pwm ))
+        # max value 255
+        (( desired_pwm = (desired_pwm > 255)? 255: desired_pwm ))
+    fi
+}
+
+
 # query system temperatures and set the global sys_temp with the highest
 # map the current sys_temp to a desired pwm value
-# we use base_pwm_value+sqr((sys_temp-sys_threshold)/2) to get a nice curve
+# we use base_pwm_value+sqr((sys_temp-sys_threshold)/3) to get a nice curve
 function get_sys() {
 
     # read the system board temp sensor via acpi
@@ -167,21 +190,7 @@ function get_sys() {
     # choose the greatest of the core and system temps
     (( sys_temp= (acpi_temp > cpu_temp)? acpi_temp : cpu_temp ))
 
-    # process desired pwm
-    if [[ $sys_temp -le $sys_threshold ]] ; then
-        sys_thresh_details="$sys_temp < $sys_threshold"
-        sys_desired_pwm=$min_pwm
-    else
-        sys_thresh_details="$sys_temp > $sys_threshold"
-
-        # get the difference above threshold and fudge factor the difference
-        (( sys_desired_pwm = (sys_temp-sys_threshold)/3  ))
-        # square and add to the base_pwm value
-        (( sys_desired_pwm = sys_desired_pwm*sys_desired_pwm + min_pwm ))
-        # max value 255
-        (( sys_desired_pwm = (sys_desired_pwm>255)? 255: sys_desired_pwm ))
-
-    fi
+    scale_pwm "sys" 30
 
     debug 2 "SYS  PWM: $sys_desired_pwm  TEMP: $sys_thresh_details LAST: $last_sys_temp ( cpu=$cpu_temp acpi=$acpi_temp )"
 }
@@ -219,25 +228,10 @@ function get_nvme() {
         nvme_details+=("$hwmon_nvme=[${alltemps[*]}]")
     done
 
-    # process desired pwm
-    if [[ $nvme_temp -le $nvme_threshold ]] ; then
-        nvme_thresh_details="$nvme_temp < $nvme_threshold"
-        nvme_desired_pwm=$min_pwm
-
-    else
-        nvme_thresh_details="$nvme_temp > $nvme_threshold"
-
-        # get the difference above threshold and fudge factor the difference
-        (( nvme_desired_pwm = (nvme_temp-nvme_threshold)*10/18  ))
-        # square and add to the base_pwm value
-        (( nvme_desired_pwm = nvme_desired_pwm*nvme_desired_pwm + min_pwm ))
-        # max value 255
-        (( nvme_desired_pwm = (nvme_desired_pwm>255)? 255: nvme_desired_pwm ))
-    fi
+    scale_pwm "nvme" 18
 
     debug 2 "NVME PWM: $nvme_desired_pwm  TEMP: $nvme_thresh_details LAST: $last_nvme_temp ( ${nvme_details[*]} )"
 }
-
 
 
 # query all drive temperatures and set the global hdd_temp to the highest
@@ -273,23 +267,11 @@ function get_hdd() {
         hdd_details+="skipped update"
     fi
 
-    # process desired pwm
-    if [[ $hdd_temp -le $hdd_threshold ]] ; then
-        hdd_thresh_details="$hdd_temp < $hdd_threshold"
-        hdd_desired_pwm=$min_pwm
-    else
-        hdd_thresh_details="$hdd_temp > $hdd_threshold"
-
-        # get the difference above threshold and fudge factor the difference
-        (( hdd_desired_pwm = (hdd_temp-hdd_threshold)*10/18  ))
-        # square and add to the base_pwm value
-        (( hdd_desired_pwm = hdd_desired_pwm*hdd_desired_pwm + min_pwm ))
-        # max value 255
-        (( hdd_desired_pwm = (hdd_desired_pwm>255)? 255: hdd_desired_pwm ))
-    fi
+    scale_pwm "hdd" 18
 
     debug 2 "HDD  PWM: $hdd_desired_pwm  TEMP: $hdd_thresh_details LAST: $last_hdd_temp ( ${hdd_details[*]} )"
 }
+
 
 # determine desired zone based on current temp
 function get_desired_pwm() {
