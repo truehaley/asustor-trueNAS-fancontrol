@@ -63,7 +63,11 @@ mailalerts=0
 mail_address=admin@locahost
 # hostname we use to identify ourselves in email alerts
 mail_hostname=truenas.local
-debug 2 "STARTUP: mail_address=$mail_address mail_hostname=$mail_hostname"
+if [[ $mailalerts -ge 1 ]] ; then
+    debug 2 "STARTUP: mail_address=$mail_address mail_hostname=$mail_hostname"
+else
+    debug 2 "STARTUP: no mail alerts configured"
+fi
 
 # how often we check temps / set speed ( in seconds )
 frequency=10
@@ -100,40 +104,35 @@ sys_delta_threshold=4
 
 # which /sys/class/hwmon symlink points to the asustor_it87 ( fan speed )
 hwmon_it87="/sys/class/hwmon/"`ls -lQ /sys/class/hwmon | grep -i it87 | cut -d "\"" -f 2`
-debug 2 "STARTUP: hwmon_it87=$hwmon_it87"
+debug 1 "STARTUP: hwmon_it87=$hwmon_it87"
 
 # which /sys/class/hwmon symlink points to the intel coretemp sensors
 hwmon_coretemp="/sys/class/hwmon/"`ls -lQ /sys/class/hwmon | grep -i coretemp | cut -d "\"" -f 2`
-debug 2 "STARTUP: hwmon_coretemp=$hwmon_coretemp"
+debug 1 "STARTUP: hwmon_coretemp=$hwmon_coretemp"
 
 # which /sys/class/hwmon symlink points to the acpi sensors ( board temperature sensor )
 hwmon_acpi="/sys/class/hwmon/"`ls -lQ /sys/class/hwmon | grep -i thermal_zone0 | cut -d "\"" -f 2`
-debug 2 "STARTUP: hwmon_acpi=$hwmon_acpi"
+debug 1 "STARTUP: hwmon_acpi=$hwmon_acpi"
 
 
 # Use an array to find which /sys/class/hwmon symlinks point to the NVMe drive sensors and assign them sequential variables
 #    This should find all NVMe drives regardless of the number installed, and assign them to
 #    sequential variables hwmon_nvme1, hwmon_nvme2 ... hwmon_nvme(x)
-debug 2 "STARTUP: NVMe hardware monitoring devices:"
+debug 1 "STARTUP: NVMe hardware monitoring devices:"
 declare -A all_hwmon_nvmes=()
-i=1
 while read -r path; do
-  all_hwmon_nvmes["nvme$i"]="/sys/class/hwmon/$path"
-  debug 2 "STARTUP nvme$i=/sys/class/hwmon/$path"
-  (( i++ ))
+    declare current_nvme="nvme${#all_hwmon_nvmes[*]}"
+    all_hwmon_nvmes[$current_nvme]="/sys/class/hwmon/$path"
+    debug 1 "STARTUP:   $current_nvme=/sys/class/hwmon/$path"
 done < <(ls -lQ /sys/class/hwmon | grep -i nvme | cut -d "\"" -f 2)
 
-# Assign all the paths stored in the all_hwmon_nvmes array to sequential hwmon_nvme variables
-#for ((j=1; j<i; j++)); do
-#  variable_name="hwmon_nvme$j"
-#  eval "$variable_name=\"${all_hwmon_nvmes[$j]}\""
-#done
-
-# Display the NVMe hardware monitoring devices found if debug is on
-#if [ $debugLvl -ge 2 ]; then
-#  echo "STARTUP: NVMe hardware monitoring devices:"
-#  eval "declare -p hwmon_nvme{1..$((i-1))}"
-#fi
+# The following will find all direct-attached sata interface drives, it will not include usb sticks
+debug 2 "STARTUP: HDD drives:"
+declare -A all_hdds=()
+while read -r current_hdd; do
+    all_hdds[$current_hdd]="/dev/$current_hdd"
+    debug 1 "STARTUP:   $current_hdd=/dev/$current_hdd"
+done < <(lsblk -SP | grep -i sata | cut -d "\"" -f 2)
 
 
 # set fan speed to desired_pwm
@@ -145,10 +144,10 @@ function set_fan_pwm() {
     echo $new_pwm >$hwmon_it87/pwm1
 }
 
-
 # query fan speed and set the global fan_rpm
 function get_fan_rpm() {
     fan_rpm=$(<"$hwmon_it87/fan1_input")
+    fan_pwm=$(<"$hwmon_it87/pwm1")
     debug 2 "GET_FAN_RPM:   $fan_rpm"
 }
 
@@ -197,14 +196,14 @@ function get_hdd_temp() {
     # if you have an external HDD / m.2 sata ssd as the boot device you'll need to exclude it from the drive list so as to ignore it's temperature
 
     declare -a details=()
-    for i in sda sdb sdc sdd sde sdf sdg sdh
-    do
+    for hdd in ${!all_hdds[@]}; do
         # SMART attribute 194 is drive temperature
-        temp=`smartctl -A /dev/$i | awk '$1 == "194" { print $10 }'`
+        declare hdd_path=${all_hdds[$hdd]}
+        temp=`smartctl -A $hdd_path | awk '$1 == "194" { print $10 }'`
         if [ -z $temp ]; then
             debug 3 "temp is NULL - drive does not exist"
         else
-            details+=("$i=$temp")
+            details+=("$hdd=$temp")
             debug 3 "drive=$i temp=$temp"
             if [ $temp -gt $hdd_temp ]; then
                 hdd_temp=$temp
@@ -371,12 +370,12 @@ get_sys_temp
 get_nvme_temp
 get_hdd_temp
 
+# we use the variables 'last_pwm' 'last_sys_temp' and 'last_hdd_temp' to track what the pwm/temps values were last time
+# through the loop - so we only change the fan speeds when there's a state change as opposed to every iteration
 last_sys_temp=$sys_temp
 last_nvme_temp=$nvme_temp
 last_hdd_temp=$hdd_temp
 
-# we use the variables 'last_pwm' 'last_sys_temp' and 'last_hdd_temp' to track what the pwm/temps values were last time
-# through the loop - so we only change the fan speeds when there's a state change  as opposed to every iteration
 
 # get initial pwm value
 
@@ -495,7 +494,7 @@ while true; do
         fi
     fi
 
-    debug 2 "MAIN: sleeping for $frequency seconds"
+    debug 3 "MAIN: sleeping for $frequency seconds"
     sleep $frequency
 
 done
