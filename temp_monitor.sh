@@ -195,7 +195,7 @@ function get_hdd_temp() {
     #
     # if you have an external HDD / m.2 sata ssd as the boot device you'll need to exclude it from the drive list so as to ignore it's temperature
 
-    declare -a details=()
+    declare -a hdd_details=()
     for hdd in ${!all_hdds[@]}; do
         # SMART attribute 194 is drive temperature
         declare hdd_path=${all_hdds[$hdd]}
@@ -203,7 +203,7 @@ function get_hdd_temp() {
         if [ -z $temp ]; then
             debug 3 "temp is NULL - drive does not exist"
         else
-            details+=("$hdd=$temp")
+            hdd_details+=("$hdd=$temp")
             debug 3 "drive=$i temp=$temp"
             if [ $temp -gt $hdd_temp ]; then
                 hdd_temp=$temp
@@ -212,7 +212,7 @@ function get_hdd_temp() {
         fi
     done
 
-    debug 2 "GET_HDD_TEMP:  $hdd_temp ( ${details[*]} )"
+    debug 2 "GET_HDD_TEMP:  $hdd_temp ( ${hdd_details[*]} )"
 }
 
 # query system temperatures and set the global sys_temp with the highest
@@ -251,20 +251,12 @@ function map_nvme_pwm() {
         details="nvme_temp=$nvme_temp  OVER threshold=$nvme_threshold"
         debug 3 "MAP_NVME_PWM: nvme temp=" $nvme_temp " and is over threshold"
 
-        # get the difference above threshold
-        let nvme_desired_pwm=$nvme_temp-$nvme_threshold
-        # fudge factor the difference
-        let nvme_desired_pwm=$nvme_desired_pwm*10/18
-        # square it
-        let nvme_desired_pwm=$nvme_desired_pwm*$nvme_desired_pwm
-        # add it to the base_pwm value
-        let nvme_desired_pwm=$min_pwm+$nvme_desired_pwm
-
-    fi
-
-    if [[ $nvme_desired_pwm -gt 255 ]] ; then
-        # over max - truncate to max
-        nvme_desired_pwm=255
+        # get the difference above threshold and fudge factor the difference
+        (( nvme_desired_pwm = (nvme_temp-nvme_threshold)*10/18  ))
+        # square and add to the base_pwm value
+        (( nvme_desired_pwm = nvme_desired_pwm*nvme_desired_pwm + min_pwm ))
+        # max value 255
+        (( nvme_desired_pwm = (nvme_desired_pwm>255)? 255: nvme_desired_pwm ))
     fi
 
     debug 2 "MAP_NVME_PWM:    $nvme_desired_pwm ( $details )"
@@ -283,20 +275,13 @@ function map_hdd_pwm() {
         details="hdd_temp=$hdd_temp  OVER threshold=$hdd_threshold"
         debug 3 "MAP_HDD_PWM: hdd_temp=" $hdd_temp " and is over threshold"
 
-        # get the difference above threshold
-        let hdd_desired_pwm=$hdd_temp-$hdd_threshold
-        # fudge factor the difference
-        let hdd_desired_pwm=$hdd_desired_pwm*10/18
-        # square it
-        let hdd_desired_pwm=$hdd_desired_pwm*$hdd_desired_pwm
-        # add it to the base_pwm value
-        let hdd_desired_pwm=$min_pwm+$hdd_desired_pwm
+        # get the difference above threshold and fudge factor the difference
+        (( hdd_desired_pwm = (hdd_temp-hdd_threshold)*10/18  ))
+        # square and add to the base_pwm value
+        (( hdd_desired_pwm = hdd_desired_pwm*hdd_desired_pwm + min_pwm ))
+        # max value 255
+        (( hdd_desired_pwm = (hdd_desired_pwm>255)? 255: hdd_desired_pwm ))
 
-    fi
-
-    if [[ $hdd_desired_pwm -gt 255 ]] ; then
-        # over max - truncate to max
-        hdd_desired_pwm=255
     fi
 
     debug 2 "MAP_HDD_PWM:     $hdd_desired_pwm (  $details )"
@@ -320,20 +305,13 @@ function map_sys_pwm() {
         details="sys_temp=$sys_temp  OVER threshold=$sys_threshold"
         debug 3 "MAP_SYS_PWM: sys_temp=" $sys_temp " and is over threshold"
 
-        # get the difference above threshold
-        let sys_desired_pwm=$sys_temp-$sys_threshold
-        # halve the difference
-        let sys_desired_pwm=$sys_desired_pwm/3
-        # then square it
-        let sys_desired_pwm=$sys_desired_pwm*$sys_desired_pwm
-        # add it to the base pwm value
-        let sys_desired_pwm=$min_pwm+$sys_desired_pwm
+        # get the difference above threshold and fudge factor the difference
+        (( sys_desired_pwm = (sys_temp-sys_threshold)/3  ))
+        # square and add to the base_pwm value
+        (( sys_desired_pwm = sys_desired_pwm*sys_desired_pwm + min_pwm ))
+        # max value 255
+        (( sys_desired_pwm = (sys_desired_pwm>255)? 255: sys_desired_pwm ))
 
-    fi
-
-    if [[ $sys_desired_pwm -gt 255 ]] ; then
-        # over max - truncate to max
-        sdd_desired_pwm=255
     fi
 
     debug 2 "MAP_SYS_PWM:     $sys_desired_pwm (  $details )"
