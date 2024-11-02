@@ -44,7 +44,9 @@ exec 1> >(logger -s -t $(basename $0)) 2>&1
 #   1 = minimal, fan changes only
 #   2 = verbose, all temp details
 #   3 = extremely verbose
-debugLvl=1
+declare -r debugLvl=1
+# When debug output level is 1, only log output every "idleDebugInterval" seconds
+declare -r idle_debug_interval=30
 
 function debug() {
     declare -ri outputLvl=$1
@@ -297,10 +299,21 @@ function get_desired_pwm() {
         desired_pwm=$hdd_desired_pwm
         selected_pwm=" hdd"
         full_thresh_details="  SYS: $sys_thresh_details  NVME: $nvme_thresh_details [HDD: $hdd_thresh_details]"
-    else
+    elif [[ $sys_desired_pwm -gt $nvme_desired_pwm ]] && [[ $sys_desired_pwm -gt $hdd_desired_pwm ]] ; then
         desired_pwm=$sys_desired_pwm
         selected_pwm=" sys"
         full_thresh_details=" [SYS: $sys_thresh_details] NVME: $nvme_thresh_details  HDD: $hdd_thresh_details "
+    else
+        # they are all the same level
+        desired_pwm=$sys_desired_pwm
+        selected_pwm=" sys"
+        if [[ $desired_pwm -gt $min_pwm ]]; then
+            # all high!
+            full_thresh_details=" [SYS: $sys_thresh_details  NVME: $nvme_thresh_details  HDD: $hdd_thresh_details]"
+        else
+            # idle
+            full_thresh_details="  SYS: $sys_thresh_details  NVME: $nvme_thresh_details  HDD: $hdd_thresh_details "
+        fi
     fi
     debug 3 "CHOOSE_PWM: $selected_pwm $desired_pwm ( sys_pwm=$sys_desired_pwm nvme_pwm=$nvme_desired_pwm hdd_pwm=$hdd_desired_pwm )"
 
@@ -317,6 +330,8 @@ debug 2 "--------------------------------------------"
 last_sys_temp=0
 last_nvme_temp=0
 last_hdd_temp=0
+# how long until our next idle debug report
+idle_elapsed=0
 
 get_fan_rpm
 get_sys
@@ -353,8 +368,8 @@ while true; do
     if [[ $desired_pwm -gt $last_pwm ]] ; then
        # fan speed increase desired - react immediately
 
-       debug 1 "PWM: ${desired_pwm}^ LAST RPM: $fan_rpm TEMPS: $full_thresh_details"
-       #debug 1 "****: fan INCREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )"
+       debug 1 "PWM: ${desired_pwm}+  LAST RPM: $fan_rpm   TEMPS: $full_thresh_details"
+       idle_elapsed=0
 
        if [[ $mailalerts -ge 1 ]] ; then
           echo "****: fan INCREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )" | mail $mail_address -s "$mail_name - temperature alert"
@@ -386,8 +401,8 @@ while true; do
 
             # we've got sufficient downward temp delta - actually change the fan speed
 
-            debug 1 "PWM: ${desired_pwm}v LAST RPM: $fan_rpm TEMPS: $full_thresh_details"
-            #debug 1 "****: fan DECREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )"
+            debug 1 "PWM: ${desired_pwm}-  LAST RPM: $fan_rpm   TEMPS: $full_thresh_details"
+            idle_elapsed=0
 
             if [[ $mailalerts -ge 1 ]] ; then
                 echo "****: fan DECREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )" | mail $mail_address -s "$mail_name - temperature alert"
@@ -403,14 +418,22 @@ while true; do
             last_hdd_temp=$hdd_temp
 
         else
-
             # not enough downward delta to trigger an actual change yet
 
-            debug 1 "PWM: ${desired_pwm}~ LAST RPM: $fan_rpm TEMPS: $full_thresh_details"
-            #debug 1 "****: fan PENDING  pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm ) - not enough delta ( $sys_delta $nvme_delta $hdd_delta ) yet!"
+            debug 1 "PWM: ${desired_pwm}~  LAST RPM: $fan_rpm   TEMPS: $full_thresh_details"
+            idle_elapsed=0
         fi
     else
-        debug 1 "PWM: ${desired_pwm}- LAST RPM: $fan_rpm TEMPS: $full_thresh_details"
+        if [[ $desired_pwm -gt $min_pwm ]] || [[ $debugLvl -ge 2 ]]; then
+            # always output when pwm is above min or debugLvl is 2 or more
+            idle_elapsed=0
+        fi
+        if [[ $idle_elapsed -le $check_interval ]]; then
+            debug 1 "PWM: ${desired_pwm}   LAST RPM: $fan_rpm   TEMPS: $full_thresh_details"
+            idle_elapsed=$idle_debug_interval
+        else
+            (( idle_elapsed -= check_interval ))
+        fi
     fi
 
     debug 3 "MAIN: sleeping for $check_interval seconds"
