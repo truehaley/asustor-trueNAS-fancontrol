@@ -28,7 +28,7 @@
 #    IMPORTANT: must use the it87 branch
 
 
-# uses sqr(temp above threshold/2)+base_pwm for cpu/sys response curve
+# uses sqr(temp above threshold/3)+base_pwm for cpu/sys response curve
 # uses sqr(temp above threshold/1.8)+base_pwm for NVME response curve
 #
 # this gives a slow initial ramp up and a rapid final ramp up across the desired temp range
@@ -44,7 +44,7 @@ exec 1> >(logger -s -t $(basename $0)) 2>&1
 #   1 = minimal, fan changes only
 #   2 = verbose, all temp details
 #   3 = extremely verbose
-debugLvl=2
+debugLvl=1
 
 function debug() {
     declare -ri outputLvl=$1
@@ -76,12 +76,8 @@ declare -r check_interval=10
 # (sampling the sys and nvme sensors is lightweight, whereas querying the hdd sensors via SMART disrupts disk i/o - and hdd temp doesn't change that fast)
 declare -r hdd_check_interval=120
 
-# the emperatures above which we start to increase fan speed
-declare -r sys_threshold=50
-declare -r nvme_threshold=35
-declare -r hdd_threshold=38
 
-# minimum pwm value we ever want to set the fan to
+# minimum pwm value we want the fan to run at
 # Stats     Noctua NF-P12   Stock SAB4B2U
 #   70          550             1000
 #   100         760
@@ -90,6 +86,21 @@ declare -r hdd_threshold=38
 #   200         1415
 #   255         1730
 declare -r min_pwm=140
+
+# Minimum PWM setting (above) should keep all temperatures below their target temps when system is at idle
+# Any temperature read above the max temp will cause fans to operate at full speed
+declare -r sys_target_temp=50
+declare -r sys_max_temp=85      # documented limit for N5105 is 105
+declare -r nvme_target_temp=32
+declare -r nvme_max_temp=50     # documented limit for crucial p3 plus is 70
+declare -r hdd_target_temp=38
+declare -r hdd_max_temp=50      # documented limit for seagate ironwolf is 65
+
+# Scale factors are roughly determied by:  (max_temp-target_temp)*10 / sqrt(255-min_pwm)
+declare -r sys_scale_factor=32
+declare -r nvme_scale_factor=16
+declare -r hdd_scale_factor=11
+
 
 # How much of a temp change do we look for before altering fan speeds so we limit fan hunting
 declare -r nvme_delta_threshold=2
@@ -150,22 +161,29 @@ function get_fan_rpm() {
     debug 2 "FAN  PWM: $fan_pwm  RPM:  $fan_rpm"
 }
 
-
+# map current temp to desired pwm values
+# we use min_pwm+sqr((temp-target)*10/scale_factor) to get a nice curve that ramps more quickly toward
+#   max pwm as we approach the max temp (assuming scale factors are set correctly above)
 function scale_pwm () {
+    # reference appropriate global vars based on function parameter of "sys" "hdd" or "nvme"
     declare -n temp="$1_temp"
-    declare -n thresh="$1_threshold"
+    declare -n target="$1_target_temp"
+    declare -n max="$1_max_temp"
     declare -n thresh_details="$1_thresh_details"
     declare -n desired_pwm="$1_desired_pwm"
-    declare -i fudge=$2
+    declare -n scale="$1_scale_factor"
 
-    if [[ $temp -le $thresh ]] ; then
-        thresh_details="$temp < $thresh"
+    if [[ $temp -le $target ]] ; then
+        thresh_details="$temp < $target "
         desired_pwm=$min_pwm
+    elif [[ $temp -ge $max ]] ; then
+        thresh_details="$temp > $max!"
+        desired_pwm=255
     else
-        thresh_details="$temp > $thresh"
+        thresh_details="$temp > $target "
 
-        # get the difference above threshold and fudge factor the difference
-        (( desired_pwm = (temp-thresh)*10/fudge  ))
+        # get the amount above target and apply the scale factor
+        (( desired_pwm = (temp-target)*10/scale ))
         # square and add to the base_pwm value
         (( desired_pwm = desired_pwm*desired_pwm + min_pwm ))
         # max value 255
@@ -174,9 +192,7 @@ function scale_pwm () {
 }
 
 
-# query system temperatures and set the global sys_temp with the highest
-# map the current sys_temp to a desired pwm value
-# we use base_pwm_value+sqr((sys_temp-sys_threshold)/3) to get a nice curve
+# query system temperatures and set the global sys_temp with the highest, them map to desired pwm value
 function get_sys() {
 
     # read the system board temp sensor via acpi
@@ -190,16 +206,13 @@ function get_sys() {
     # choose the greatest of the core and system temps
     (( sys_temp= (acpi_temp > cpu_temp)? acpi_temp : cpu_temp ))
 
-    scale_pwm "sys" 30
+    scale_pwm "sys"
 
     debug 2 "SYS  PWM: $sys_desired_pwm  TEMP: $sys_thresh_details LAST: $last_sys_temp ( cpu=$cpu_temp acpi=$acpi_temp )"
 }
 
 
-# query all NVMe drive temperatures and set the global hdd_temp to the highest #
-# map the current nvme_temp to a desired pwm value
-# we use base_pwm_value+sqr(hdd_temp-hdd_threshold)/1.8 to get a nice curve.
-# I used 1.8 as the fudge factor to get max fan rpm at NVME temp of 60 degrees
+# query all NVMe drive temperatures and set the global hdd_temp to the highest #, then map to desired pwm value
 function get_nvme() {
 
     # Initialize the maximum hdd (NVMe) temperature variable (Absolute zero, Baby!)
@@ -228,7 +241,7 @@ function get_nvme() {
         nvme_details+=("$hwmon_nvme=[${alltemps[*]}]")
     done
 
-    scale_pwm "nvme" 18
+    scale_pwm "nvme"
 
     debug 2 "NVME PWM: $nvme_desired_pwm  TEMP: $nvme_thresh_details LAST: $last_nvme_temp ( ${nvme_details[*]} )"
 }
@@ -267,7 +280,7 @@ function get_hdd() {
         hdd_details+="skipped update"
     fi
 
-    scale_pwm "hdd" 18
+    scale_pwm "hdd"
 
     debug 2 "HDD  PWM: $hdd_desired_pwm  TEMP: $hdd_thresh_details LAST: $last_hdd_temp ( ${hdd_details[*]} )"
 }
@@ -279,12 +292,15 @@ function get_desired_pwm() {
     if [[ $nvme_desired_pwm -gt $sys_desired_pwm ]] && [[ $nvme_desired_pwm -gt $hdd_desired_pwm ]] ; then
         desired_pwm=$nvme_desired_pwm
         selected_pwm="nvme"
+        full_thresh_details="  SYS: $sys_thresh_details [NVME: $nvme_thresh_details] HDD: $hdd_thresh_details "
     elif [[ $hdd_desired_pwm -gt $sys_desired_pwm ]] && [[ $hdd_desired_pwm -gt $nvme_desired_pwm ]] ; then
         desired_pwm=$hdd_desired_pwm
         selected_pwm=" hdd"
+        full_thresh_details="  SYS: $sys_thresh_details  NVME: $nvme_thresh_details [HDD: $hdd_thresh_details]"
     else
         desired_pwm=$sys_desired_pwm
         selected_pwm=" sys"
+        full_thresh_details=" [SYS: $sys_thresh_details] NVME: $nvme_thresh_details  HDD: $hdd_thresh_details "
     fi
     debug 3 "CHOOSE_PWM: $selected_pwm $desired_pwm ( sys_pwm=$sys_desired_pwm nvme_pwm=$nvme_desired_pwm hdd_pwm=$hdd_desired_pwm )"
 
@@ -337,7 +353,8 @@ while true; do
     if [[ $desired_pwm -gt $last_pwm ]] ; then
        # fan speed increase desired - react immediately
 
-       debug 1 "****: fan INCREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )"
+       debug 1 "PWM: ${desired_pwm}^ LAST RPM: $fan_rpm TEMPS: $full_thresh_details"
+       #debug 1 "****: fan INCREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )"
 
        if [[ $mailalerts -ge 1 ]] ; then
           echo "****: fan INCREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )" | mail $mail_address -s "$mail_name - temperature alert"
@@ -351,9 +368,7 @@ while true; do
        last_sys_temp=$sys_temp
        last_nvme_temp=$nvme_temp
        last_hdd_temp=$hdd_temp
-    fi
-
-    if [[ $desired_pwm -lt $last_pwm ]] ; then
+    elif [[ $desired_pwm -lt $last_pwm ]] ; then
         # fan speed decrease desired
 
         # calculate deltas from last reading for each sensor
@@ -371,7 +386,8 @@ while true; do
 
             # we've got sufficient downward temp delta - actually change the fan speed
 
-            debug 1 "****: fan DECREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )"
+            debug 1 "PWM: ${desired_pwm}v LAST RPM: $fan_rpm TEMPS: $full_thresh_details"
+            #debug 1 "****: fan DECREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )"
 
             if [[ $mailalerts -ge 1 ]] ; then
                 echo "****: fan DECREASE pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm )" | mail $mail_address -s "$mail_name - temperature alert"
@@ -390,8 +406,11 @@ while true; do
 
             # not enough downward delta to trigger an actual change yet
 
-            debug 1 "****: fan PENDING  pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm ) - not enough delta ( $sys_delta $nvme_delta $hdd_delta ) yet!"
+            debug 1 "PWM: ${desired_pwm}~ LAST RPM: $fan_rpm TEMPS: $full_thresh_details"
+            #debug 1 "****: fan PENDING  pwm=$desired_pwm ( nvme_temp=$nvme_temp hdd_temp=$hdd_temp sys_temp=$sys_temp fan_rpm=$fan_rpm ) - not enough delta ( $sys_delta $nvme_delta $hdd_delta ) yet!"
         fi
+    else
+        debug 1 "PWM: ${desired_pwm}- LAST RPM: $fan_rpm TEMPS: $full_thresh_details"
     fi
 
     debug 3 "MAIN: sleeping for $check_interval seconds"
