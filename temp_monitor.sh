@@ -79,7 +79,7 @@ declare -r check_interval=10
 declare -r hdd_check_interval=120
 
 
-# minimum pwm value we want the fan to run at
+# idle pwm value we want the fan to run at
 # Stats     Noctua NF-P12   Stock SAB4B2U
 #   70          550             1000
 #   100         760
@@ -87,7 +87,7 @@ declare -r hdd_check_interval=120
 #   140         1000
 #   200         1415
 #   255         1730
-declare -r min_pwm=140
+declare -r idle_pwm=140
 
 # Minimum PWM setting (above) should keep all temperatures below their target temps when system is at idle
 # Any temperature read above the max temp will cause fans to operate at full speed
@@ -98,7 +98,7 @@ declare -r nvme_max_temp=50     # documented limit for crucial p3 plus is 70
 declare -r hdd_target_temp=38
 declare -r hdd_max_temp=50      # documented limit for seagate ironwolf is 65
 
-# Scale factors are roughly determied by:  (max_temp-target_temp)*10 / sqrt(255-min_pwm)
+# Scale factors are roughly determied by:  (max_temp-target_temp)*10 / sqrt(255-idle_pwm)
 declare -r sys_scale_factor=32
 declare -r nvme_scale_factor=16
 declare -r hdd_scale_factor=11
@@ -164,7 +164,7 @@ function get_fan_rpm() {
 }
 
 # map current temp to desired pwm values
-# we use min_pwm+sqr((temp-target)*10/scale_factor) to get a nice curve that ramps more quickly toward
+# we use idle_pwm+sqr((temp-target)*10/scale_factor) to get a nice curve that ramps more quickly toward
 #   max pwm as we approach the max temp (assuming scale factors are set correctly above)
 function scale_pwm () {
     # reference appropriate global vars based on function parameter of "sys" "hdd" or "nvme"
@@ -177,17 +177,17 @@ function scale_pwm () {
 
     if [[ $temp -le $target ]] ; then
         thresh_details="$temp < $target "
-        desired_pwm=$min_pwm
+        desired_pwm=$idle_pwm
     elif [[ $temp -ge $max ]] ; then
         thresh_details="$temp > $max!"
         desired_pwm=255
     else
         thresh_details="$temp > $target "
 
-        # get the amount above target and apply the scale factor
+        # get the amount above target and apply the scale factor and a minimum change
         (( desired_pwm = (temp-target)*10/scale ))
-        # square and add to the base_pwm value
-        (( desired_pwm = desired_pwm*desired_pwm + min_pwm ))
+        # square and add to the idle_pwm value plus a minimum increase
+        (( desired_pwm = desired_pwm*desired_pwm + idle_pwm + 2 ))
         # max value 255
         (( desired_pwm = (desired_pwm > 255)? 255: desired_pwm ))
     fi
@@ -307,7 +307,7 @@ function get_desired_pwm() {
         # they are all the same level
         desired_pwm=$sys_desired_pwm
         selected_pwm=" sys"
-        if [[ $desired_pwm -gt $min_pwm ]]; then
+        if [[ $desired_pwm -gt $idle_pwm ]]; then
             # all high!
             full_thresh_details=" [SYS: $sys_thresh_details  NVME: $nvme_thresh_details  HDD: $hdd_thresh_details]"
         else
@@ -397,9 +397,9 @@ while true; do
         # we need to apply some degree of hysteresis on hdd_temp and sys_temp to prevent fan speed hunting,
         # variables defined at the start of the script
 
-        if [[ $nvme_delta -gt $nvme_delta_threshold ]] || [[ $hdd_delta -gt $hdd_delta_threshold ]] || [[ $sys_delta -gt $sys_delta_threshold ]]; then
+        if [[ $desired_pwm -eq $idle_pwm ]] || [[ $nvme_delta -gt $nvme_delta_threshold ]] || [[ $hdd_delta -gt $hdd_delta_threshold ]] || [[ $sys_delta -gt $sys_delta_threshold ]]; then
 
-            # we've got sufficient downward temp delta - actually change the fan speed
+            # we're back to idle, or we have sufficient downward temp delta - actually change the fan speed
 
             debug 1 "PWM: ${desired_pwm}-  LAST RPM: $fan_rpm   TEMPS: $full_thresh_details"
             idle_elapsed=0
@@ -419,12 +419,12 @@ while true; do
 
         else
             # not enough downward delta to trigger an actual change yet
-
-            debug 1 "PWM: ${desired_pwm}~  LAST RPM: $fan_rpm   TEMPS: $full_thresh_details"
+            # pwm is still running at last_pwm, not desired
+            debug 1 "PWM: ${last_pwm}~  LAST RPM: $fan_rpm   TEMPS: $full_thresh_details"
             idle_elapsed=0
         fi
     else
-        if [[ $desired_pwm -gt $min_pwm ]] || [[ $debugLvl -ge 2 ]]; then
+        if [[ $desired_pwm -gt $idle_pwm ]] || [[ $debugLvl -ge 2 ]]; then
             # always output when pwm is above min or debugLvl is 2 or more
             idle_elapsed=0
         fi
